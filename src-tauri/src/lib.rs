@@ -1,18 +1,18 @@
-use dotenv::dotenv;
+use regex::Regex;
 use reqwest::Client;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::thread;
 use tauri::{command, Emitter, State, Window};
 
-// 実行中のプロセスを管理するための構造体
 struct OptimizationState {
     child: Mutex<Option<Child>>,
 }
 
+// ユーザー表示用（ノイズ除去のみ、スペースは残す）
 fn clean_gurobi_log(raw_log: &str) -> String {
     raw_log
         .lines()
@@ -28,10 +28,102 @@ fn clean_gurobi_log(raw_log: &str) -> String {
         .join("\n")
 }
 
+// JSONの中身を再帰的に探索して、長い配列をカットする関数
+fn prune_json_recursively(v: &mut Value) {
+    match v {
+        Value::Array(arr) => {
+            // 配列の長さが「5」を超えていたらカットする
+            const MAX_ITEMS: usize = 3;
+            if arr.len() > MAX_ITEMS {
+                let original_len = arr.len();
+                // 最初の3個だけ残す
+                arr.truncate(MAX_ITEMS);
+                // 末尾に「省略しました」という情報を追加
+                arr.push(json!(format!(
+                    "... (truncated {} items) ...",
+                    original_len - MAX_ITEMS
+                )));
+            }
+            // 配列の中身もさらにチェック（ネスト対応）
+            for item in arr {
+                prune_json_recursively(item);
+            }
+        }
+        Value::Object(map) => {
+            // オブジェクトの場合は、すべての値をチェック
+            for (_, val) in map {
+                prune_json_recursively(val);
+            }
+        }
+        _ => {} // 数値、文字列、Booleanは何もしない（そのまま残す）
+    }
+}
+
+// ログの間引き機能を追加した圧縮関数
+fn compress_log_for_ai(full_log: &str) -> String {
+    let parts: Vec<&str> = full_log.split("---JSON_START---").collect();
+
+    let mut log_part = parts[0].to_string();
+    let mut json_part = String::new();
+
+    if parts.len() > 1 {
+        let raw_json = parts[1].split("---JSON_END---").next().unwrap_or("{}");
+        if let Ok(mut parsed) = serde_json::from_str::<Value>(raw_json) {
+            prune_json_recursively(&mut parsed);
+            json_part = parsed.to_string();
+        } else {
+            json_part = raw_json.to_string();
+        }
+    }
+
+    // 1. まずスペースを詰める
+    let re = Regex::new(r" +").unwrap();
+    log_part = re.replace_all(&log_part, " ").to_string();
+
+    // 2. 行ごとの間引き処理 (Sampling)
+    // カウンターを使って、数字の行だけ「間引く」
+    let mut numeric_row_count = 0;
+
+    log_part = log_part
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+
+            // 最初の文字を確認
+            let first_char = trimmed.chars().next().unwrap();
+
+            // 条件分岐
+            if first_char.is_ascii_digit() {
+                // 数字で始まる行（通常のログ行）
+                numeric_row_count += 1;
+                // 「最初の方」または「20行に1回」だけ残す
+                // ※序盤(50行目まで)は動きが激しいので全部残し、それ以降は間引く、という手もあり
+                if numeric_row_count < 20 || numeric_row_count % 20 == 0 {
+                    return true;
+                }
+                return false; // それ以外は捨てる
+            } else {
+                // 'H' (Heuristic), '*' (New solution), 文字列ヘッダーなどは全て残す
+                return true;
+            }
+        })
+        .collect::<Vec<&str>>()
+        .join("\n");
+
+    if json_part.is_empty() {
+        log_part
+    } else {
+        format!("{}\n[JSON_DATA]:{}", log_part, json_part)
+    }
+}
+
 #[command]
 async fn run_optimization(
     window: Window,
-    state: State<'_, OptimizationState>, // 状態管理
+    state: State<'_, OptimizationState>,
     script_path: String,
     args_str: String,
 ) -> Result<String, String> {
@@ -54,21 +146,6 @@ async fn run_optimization(
     let stdout = child.stdout.take().ok_or("stdout取得失敗")?;
     let stderr = child.stderr.take().ok_or("stderr取得失敗")?;
 
-    // プロセスIDをStateに保存（これで後からkillできる）
-    // ※stdoutの所有権移動前に保存すると複雑になるので、spawn直後のhandleを使うのは少し工夫が必要ですが
-    // 簡易的にキャンセル時は「プロセスを強制終了」するロジックにします。
-    // ここでは「読み取り用」とは別にキャンセル用のハンドルを持つのはRustでは難しいので、
-    // 実は「キャンセルコマンドが来たらOS側でタスクキル」する等のアプローチが楽ですが、
-    // 今回は「StateにChildを入れる」アプローチで実装します。
-    // ただし、Childの所有権は wait() で使うため、ここでは Arc<Mutex> で共有するのが一般的ですが
-    // コードが複雑になるため、今回は「キャンセルボタン＝強制終了コマンド発行」という簡易実装に逃げず、
-    // 正攻法（State管理）の一部簡略版でいきます。
-
-    // (非同期実行中にキャンセルを受け付けるため、本当はChildをArcで包む必要がありますが
-    // ここではシンプルに「読み取りスレッド」だけ回し、Child本体はローカルで持ちます。
-    // キャンセル機能は「別コマンド(taskkill)」で実装するのがWindowsでは一番確実です)
-
-    // --- ログ読み取りスレッド (変更なし) ---
     let window_clone = window.clone();
     let stdout_handle = thread::spawn(move || {
         let reader = BufReader::new(stdout);
@@ -97,12 +174,6 @@ async fn run_optimization(
         full_err
     });
 
-    // キャンセル用にStateに保存しようとすると所有権問題が出るため、
-    // 今回は「キャンセル用のフラグ」をチェックするのではなく、
-    // フロントエンドから「キャンセル」が押されたら `taskkill` を飛ばす方式にします。
-    // そのため、ここでは普通に wait します。
-
-    // プロセスIDを取得（キャンセル用）
     let pid = child.id();
     window.emit("process-pid", pid).unwrap_or(());
 
@@ -112,16 +183,15 @@ async fn run_optimization(
     let full_stderr = stderr_handle.join().unwrap_or_default();
 
     if status.success() {
+        // UIには「見やすいログ（clean_gurobi_log）」を返す
         Ok(clean_gurobi_log(&full_stdout))
     } else {
         Err(format!("Exit Code: {:?}\n{}", status.code(), full_stderr))
     }
 }
 
-// ★追加: 実行中止コマンド (Windows専用)
 #[command]
 fn kill_process(pid: u32) -> Result<(), String> {
-    // taskkill /PID <pid> /F (強制終了) /T (ツリー終了: pythonも道連れ)
     let _ = Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/F", "/T"])
         .output()
@@ -129,18 +199,54 @@ fn kill_process(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
-#[command]
-async fn analyze_log(log: String, focus_point: String, api_key: String) -> Result<String, String> {
-    // APIキーをフロントエンド(設定画面)から受け取るように変更
-    if api_key.is_empty() {
-        return Err("APIキーが設定されていません。設定画面を確認してください。".to_string());
+// ★共通化: プロンプトを作成するだけの関数
+fn build_prompt_string(log: &str, focus_point: &str) -> String {
+    // 1. 強力圧縮
+    let compressed_log = compress_log_for_ai(log);
+
+    // 2. 長さ制限 (例: 15000文字)
+    let final_log = if compressed_log.len() > 15000 {
+        format!(
+            "... (snip) ...\n{}",
+            &compressed_log[compressed_log.len() - 15000..]
+        )
+    } else {
+        compressed_log
+    };
+
+    // 3. ストイックな指示文 (改行・装飾排除)
+    let base_instruction = "あなたはデータサイエンティストです。以下の最適化計算ログを解析し、Markdown形式のレポートを作成してください。\n# 制約\n- 挨拶や前置きは不可。即座に見出し(#)から開始すること。\n- ログの引用は不可。";
+
+    let mut user_focus = "特に、結果サマリと計算プロセスの健全性について記述すること。".to_string();
+
+    if !focus_point.trim().is_empty() {
+        user_focus
+            .push_str(format!("追加指示:「{}」について深く考察すること。", focus_point).as_str());
     }
 
-    let truncated_log = if log.len() > 12000 {
-        format!("... (中略) ...\n{}", &log[log.len() - 12000..])
-    } else {
-        log
-    };
+    // 4. 結合 ([LOG]タグ使用)
+    format!("{}\n{}\n[LOG]\n{}", base_instruction, user_focus, final_log)
+}
+
+// デバッグ用コマンド (プロンプトの中身をそのまま返す)
+#[command]
+fn debug_prompt(log: String, focus_point: String) -> String {
+    let prompt = build_prompt_string(&log, &focus_point);
+    println!(
+        "--- DEBUG PROMPT START ---\n{}\n--- DEBUG PROMPT END ---",
+        prompt
+    ); // ターミナルにも出す
+    prompt
+}
+
+#[command]
+async fn analyze_log(log: String, focus_point: String, api_key: String) -> Result<String, String> {
+    if api_key.is_empty() {
+        return Err("APIキーが設定されていません。".to_string());
+    }
+
+    // ★共通関数を使ってプロンプト生成
+    let prompt = build_prompt_string(&log, &focus_point);
 
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={}",
@@ -148,27 +254,6 @@ async fn analyze_log(log: String, focus_point: String, api_key: String) -> Resul
     );
 
     let client = Client::new();
-
-    let base_instruction = "あなたはデータサイエンティストです。以下の最適化計算ログ（末尾にJSON結果がある場合が多い）を解析し、**Markdown形式**で見やすくしたレポートのみを出力してください。# 制約事項- **「以下は解析結果です」といった挨拶や前置きは一切出力しないこと。**- **いきなりMarkdownの見出し（#）から書き始めること。**- ログの中身をそのまま引用して出力しないこと。";
-
-    let mut user_focus =
-        "特に、結果のサマリと、計算プロセスの健全性についてコメントしてください。".to_string();
-
-    if !focus_point.trim().is_empty() {
-        user_focus.push_str(
-            format!(
-                "**また、特に以下の点について深く考察・解説してください**: 「{}」",
-                focus_point
-            )
-            .as_str(),
-        );
-    }
-
-    let prompt = format!(
-        "{}\n{}\n\n--- Log ---\n{}",
-        base_instruction, user_focus, truncated_log
-    );
-
     let body = json!({ "contents": [{ "parts": [{"text": prompt}] }] });
 
     let res = client
@@ -194,11 +279,12 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(OptimizationState {
             child: Mutex::new(None),
-        }) // State初期化
+        })
         .invoke_handler(tauri::generate_handler![
             run_optimization,
             analyze_log,
-            kill_process
+            kill_process,
+            debug_prompt // ★忘れずに追加
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
