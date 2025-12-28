@@ -85,11 +85,9 @@
 				scales: {
 					x: { display: false },
 					y: {
-						// ★ここを変更: 対数スケールにする
 						type: "logarithmic",
 
-						// ★重要: log(0)は計算できないため、最小値を設定しておく
-						min: 0.001,
+						min: 0.0001,
 
 						grid: { color: "#2f334d" },
 						ticks: {
@@ -218,9 +216,11 @@
 		const match = line.match(/(\d+(?:\.\d+)?)%/);
 
 		if (match && chartInstance) {
-			const val = parseFloat(match[1]);
+			let val = parseFloat(match[1]);
 			// Gapは通常0~100の間。異常値は弾く
 			if (!isNaN(val) && val <= 1000) {
+				val = Math.max(val, 0.0001);
+
 				const label = chartInstance.data.labels?.length || 0;
 				chartInstance.data.labels?.push(label);
 				chartInstance.data.datasets[0].data.push(val);
