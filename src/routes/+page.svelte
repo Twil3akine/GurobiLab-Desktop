@@ -319,7 +319,6 @@
 					<input
 						bind:value={scriptPath}
 						placeholder="Script Path..."
-						readonly
 						class="path-input"
 					/>
 				</div>
