@@ -3,21 +3,252 @@
 	import { open } from "@tauri-apps/plugin-dialog";
 	import { listen } from "@tauri-apps/api/event";
 	import { marked } from "marked";
-	import { onDestroy } from "svelte";
+	import { onDestroy, onMount, tick } from "svelte";
+	import Chart from "chart.js/auto";
 
+	// --- 変数定義 ---
 	let scriptPath = "";
-	let argsStr = "100 100";
-	let focusPoint = ""; // ★追加: 考察の指示
+	let argsStr = "";
+	let focusPoint = "";
+	let apiKey = "";
+	let isMenuOpen = false;
 
 	let logs = "";
 	let analysis = "";
-	let status = "Execute";
+	let status = "Ready";
 	let isProcessing = false;
-	let logCopyLabel = "Copy";
-	let aiCopyLabel = "Copy";
+	let currentPid: number | null = null;
 
-	// イベント解除用の関数
-	let unlisten: () => void;
+	let unlistenLog: () => void;
+	let unlistenPid: () => void;
+
+	let activeTab: "main" | "history" | "settings" = "main";
+	let historyList: any[] = [];
+
+	// グラフ関連
+	let chartCanvas: HTMLCanvasElement;
+	let chartInstance: Chart | null = null;
+
+	// --- ライフサイクル ---
+	onMount(() => {
+		apiKey = localStorage.getItem("gurobi_app_apikey") || "";
+		const savedHist = localStorage.getItem("gurobi_app_history");
+		if (savedHist) historyList = JSON.parse(savedHist);
+	});
+
+	onDestroy(() => {
+		cleanupListeners();
+		if (chartInstance) chartInstance.destroy();
+	});
+
+	// タブがmainに切り替わったときにグラフを再初期化する
+	$: if (activeTab === "main") {
+		initChart();
+	}
+
+	function cleanupListeners() {
+		if (unlistenLog) unlistenLog();
+		if (unlistenPid) unlistenPid();
+	}
+
+	// --- グラフ初期化 ---
+	async function initChart() {
+		await tick(); // DOMの描画待ち
+		if (!chartCanvas) return; // キャンバスがないなら何もしない
+
+		if (chartInstance) chartInstance.destroy(); // 既存なら破棄
+
+		chartInstance = new Chart(chartCanvas, {
+			type: "line",
+			data: {
+				labels: [],
+				datasets: [
+					{
+						label: "Gap (%)",
+						data: [],
+						borderColor: "#7aa2f7",
+						backgroundColor: "rgba(122, 162, 247, 0.1)",
+						borderWidth: 2,
+						tension: 0.2,
+						pointRadius: 0,
+						pointHoverRadius: 6,
+						fill: true,
+					},
+				],
+			},
+			options: {
+				responsive: true,
+				maintainAspectRatio: false,
+				animation: false,
+				interaction: {
+					mode: "index",
+					intersect: false,
+				},
+				scales: {
+					x: { display: false },
+					y: {
+						beginAtZero: true,
+						grid: { color: "#2f334d" },
+						ticks: { color: "#565f89", maxTicksLimit: 6 },
+						suggestedMax: 100,
+					},
+				},
+				plugins: { legend: { display: false } },
+			},
+		});
+
+		// ログが既に存在する場合（Historyから戻った時など）、グラフを復元しようとする
+		if (logs) {
+			rebuildGraphFromLogs(logs);
+		}
+	}
+
+	function rebuildGraphFromLogs(fullLog: string) {
+		if (!chartInstance) return;
+		// データリセット
+		chartInstance.data.labels = [];
+		chartInstance.data.datasets[0].data = [];
+
+		fullLog.split("\n").forEach((line) => parseLogForGraph(line, false));
+		chartInstance.update();
+	}
+
+	// --- 計算実行 ---
+	async function startOptimization() {
+		if (!scriptPath) {
+			status = "No File Selected";
+			return;
+		}
+		if (isProcessing) return;
+
+		isProcessing = true;
+		status = "Running...";
+		logs = "";
+		analysis = "";
+
+		// グラフリセット
+		if (chartInstance) {
+			chartInstance.data.labels = [];
+			chartInstance.data.datasets[0].data = [];
+			chartInstance.update();
+		}
+
+		unlistenLog = await listen<string>("log-output", (event) => {
+			const line = event.payload;
+			logs += line + "\n";
+			parseLogForGraph(line, true); // リアルタイム更新
+
+			const el = document.querySelector(".log-panel pre");
+			if (el) el.scrollTop = el.scrollHeight;
+		});
+
+		unlistenPid = await listen<number>("process-pid", (event) => {
+			currentPid = event.payload;
+		});
+
+		try {
+			const finalLog = (await invoke("run_optimization", {
+				scriptPath,
+				argsStr,
+			})) as string;
+
+			logs = finalLog;
+			cleanupListeners();
+
+			// AI解析へ
+			await askAI();
+			saveHistory();
+		} catch (error) {
+			status = "Error";
+			logs += "\nError:\n" + String(error);
+		} finally {
+			isProcessing = false;
+			currentPid = null;
+			cleanupListeners();
+		}
+	}
+
+	async function askAI() {
+		if (!logs) {
+			status = "No Logs";
+			return;
+		}
+		status = "Analyzing...";
+		isProcessing = true;
+
+		try {
+			const rawAnalysis = (await invoke("analyze_log", {
+				log: logs,
+				focusPoint,
+				apiKey,
+			})) as string;
+
+			analysis = rawAnalysis;
+			status = "Ready";
+		} catch (error) {
+			analysis += "\nAI Error: " + String(error);
+			status = "Error";
+		} finally {
+			isProcessing = false;
+		}
+	}
+
+	async function stopOptimization() {
+		if (currentPid) {
+			try {
+				await invoke("kill_process", { pid: currentPid });
+				logs += "\n[User Cancelled]\n";
+				status = "Cancelled";
+			} catch (e) {
+				console.error(e);
+			}
+		}
+	}
+
+	// --- グラフ更新ロジック ---
+	function parseLogForGraph(line: string, doUpdate: boolean) {
+		// 正規表現を少し緩くしました（空白の扱いなど）
+		// "Gap"という単語があってもなくても、行末付近の % を拾う
+		const match = line.match(/(\d+(?:\.\d+)?)%/);
+
+		if (match && chartInstance) {
+			const val = parseFloat(match[1]);
+			// Gapは通常0~100の間。異常値は弾く
+			if (!isNaN(val) && val <= 1000) {
+				const label = chartInstance.data.labels?.length || 0;
+				chartInstance.data.labels?.push(label);
+				chartInstance.data.datasets[0].data.push(val);
+
+				if (doUpdate) chartInstance.update();
+			}
+		}
+	}
+
+	// --- その他 ---
+	function saveHistory() {
+		const item = {
+			date: new Date().toLocaleString(),
+			script: scriptPath.split(/[\\/]/).pop(),
+			args: argsStr,
+			log: logs,
+			analysis: analysis,
+		};
+		historyList = [item, ...historyList].slice(0, 20);
+		localStorage.setItem("gurobi_app_history", JSON.stringify(historyList));
+	}
+
+	function loadHistoryItem(item: any) {
+		logs = item.log;
+		analysis = item.analysis;
+		activeTab = "main";
+		// mainに戻った直後にグラフ再構築が走るように tick を使うか、
+		// initChart内でログがあれば再構築するロジックに任せる
+	}
+
+	function saveSettings() {
+		localStorage.setItem("gurobi_app_apikey", apiKey);
+		alert("Settings Saved!");
+	}
 
 	async function selectFile() {
 		const file = await open({
@@ -28,376 +259,539 @@
 		if (file) scriptPath = file as string;
 	}
 
-	async function startOptimization() {
-		if (!scriptPath) {
-			status = "Select File First";
-			return;
-		}
-		if (isProcessing) return;
-
-		isProcessing = true;
-		status = "Optimizing...";
-		logs = ""; // ログをリセット
-		analysis = "";
-
-		// ★追加: リアルタイムログ受信
-		unlisten = await listen<string>("log-output", (event) => {
-			logs += event.payload + "\n";
-			// 自動スクロール
-			const el = document.querySelector(".log-panel pre");
-			if (el) el.scrollTop = el.scrollHeight;
-		});
-
-		try {
-			// Rustを実行
-			const finalCleanLog = (await invoke("run_optimization", {
-				scriptPath,
-				argsStr,
-			})) as string;
-
-			// 完了後は整形済みログに置き換え
-			logs = finalCleanLog;
-			if (unlisten) unlisten();
-
-			status = "Analyzing...";
-
-			// ★追加: focusPoint も一緒に渡す
-			const rawAnalysis = (await invoke("analyze_log", {
-				log: logs,
-				focusPoint, // 考察指示を渡す
-			})) as string;
-
-			analysis = rawAnalysis;
-			status = "Ready";
-		} catch (error) {
-			status = "Error";
-			logs += "\nError:\n" + String(error);
-			if (unlisten) unlisten();
-		} finally {
-			isProcessing = false;
-		}
-	}
-
-	// コンポーネント破棄時にリスナー解除
-	onDestroy(() => {
-		if (unlisten) unlisten();
-	});
-
-	async function copyToClipboard(text: string, target: "log" | "ai") {
+	async function copyToClipboard(text: string) {
 		if (!text) return;
-		try {
-			await navigator.clipboard.writeText(text);
-			if (target === "log") {
-				logCopyLabel = "Copied!";
-				setTimeout(() => (logCopyLabel = "Copy"), 2000);
-			} else {
-				aiCopyLabel = "Copied!";
-				setTimeout(() => (aiCopyLabel = "Copy"), 2000);
-			}
-		} catch (err) {
-			console.error(err);
-		}
+		await navigator.clipboard.writeText(text);
 	}
 </script>
 
-<main class="container">
-	<div class="controls">
-		<div class="control-row">
-			<div class="input-group file-group">
-				<button
-					class="icon-btn"
-					on:click={selectFile}
-					title="Select File">📂</button
-				>
-				<input
-					bind:value={scriptPath}
-					placeholder="Select Python Script (.py)..."
-					readonly
-					class="path-input"
-				/>
-			</div>
-		</div>
-
-		<div class="control-row bottom-row">
-			<div class="input-group args-group">
-				<span class="label">Args:</span>
-				<input
-					type="text"
-					bind:value={argsStr}
-					class="args-input"
-					placeholder="e.g. 100 50"
-				/>
-			</div>
-
-			<div class="input-group focus-group">
-				<span class="label">🎯 Focus:</span>
-				<input
-					type="text"
-					bind:value={focusPoint}
-					class="focus-input"
-					placeholder="例: Gap推移について / コスト構造の分析"
-				/>
-			</div>
-
+<div class="layout">
+	<aside class="sidebar" class:open={isMenuOpen}>
+		<div class="sidebar-header">
 			<button
-				on:click={startOptimization}
-				disabled={isProcessing || !scriptPath}
-				class="run-btn"
-				class:processing={isProcessing}
+				class="hamburger"
+				on:click={() => (isMenuOpen = !isMenuOpen)}>☰</button
 			>
-				{status}
+			{#if isMenuOpen}<span class="brand">Gurobi MCP</span>{/if}
+		</div>
+		<nav>
+			<button
+				class:active={activeTab === "main"}
+				on:click={() => (activeTab = "main")}
+				title="Run"
+			>
+				<span class="icon">📊</span>{#if isMenuOpen}<span class="text"
+						>Run</span
+					>{/if}
 			</button>
-		</div>
-	</div>
+			<button
+				class:active={activeTab === "history"}
+				on:click={() => (activeTab = "history")}
+				title="History"
+			>
+				<span class="icon">🕒</span>{#if isMenuOpen}<span class="text"
+						>History</span
+					>{/if}
+			</button>
+			<button
+				class:active={activeTab === "settings"}
+				on:click={() => (activeTab = "settings")}
+				title="Settings"
+			>
+				<span class="icon">⚙️</span>{#if isMenuOpen}<span class="text"
+						>Settings</span
+					>{/if}
+			</button>
+		</nav>
+	</aside>
 
-	<div class="panels">
-		<div class="panel log-panel">
-			<div class="panel-header">
-				<h2>Execution Logs</h2>
-				<button
-					class="copy-btn"
-					on:click={() => copyToClipboard(logs, "log")}
-					>{logCopyLabel}</button
+	<main class="content">
+		{#if activeTab === "main"}
+			<div class="controls-area">
+				<div class="control-row">
+					<button class="icon-btn" on:click={selectFile}>📂</button>
+					<input
+						bind:value={scriptPath}
+						placeholder="Script Path..."
+						readonly
+						class="path-input"
+					/>
+				</div>
+				<div class="control-row bottom">
+					<div class="input-wrap">
+						<span class="label">Args</span>
+						<input
+							bind:value={argsStr}
+							placeholder="e.g. 100 100"
+						/>
+					</div>
+					<div class="input-wrap focus-wrap">
+						<span class="label">Focus</span>
+						<input
+							bind:value={focusPoint}
+							placeholder="Ask AI about results..."
+							on:keydown={(e) => e.key === "Enter" && askAI()}
+						/>
+					</div>
+
+					<div class="action-buttons">
+						{#if isProcessing && currentPid}
+							<button class="stop-btn" on:click={stopOptimization}
+								>⏹ Stop</button
+							>
+						{:else}
+							<button
+								class="run-btn"
+								on:click={startOptimization}
+								disabled={!scriptPath || isProcessing}
+							>
+								▶ Run
+							</button>
+							<button
+								class="ask-btn"
+								on:click={askAI}
+								disabled={!logs || isProcessing}
+							>
+								💬 Ask AI
+							</button>
+						{/if}
+					</div>
+				</div>
+			</div>
+
+			<div class="chart-wrapper">
+				<canvas bind:this={chartCanvas}></canvas>
+			</div>
+
+			<div class="panels">
+				<div class="panel">
+					<div class="panel-head">
+						<span>Logs</span>
+						<button
+							class="copy-btn"
+							on:click={() => copyToClipboard(logs)}>Copy</button
+						>
+					</div>
+					<pre>{logs}</pre>
+				</div>
+				<div class="panel">
+					<div class="panel-head">
+						<span>Analysis</span>
+						<button
+							class="copy-btn"
+							on:click={() => copyToClipboard(analysis)}
+							>Copy</button
+						>
+					</div>
+					<div class="markdown-body">
+						{#await marked.parse(analysis)}
+							<p class="loading">Thinking...</p>
+						{:then html}
+							{@html html}
+						{/await}
+					</div>
+				</div>
+			</div>
+		{/if}
+
+		{#if activeTab === "history"}
+			<h2>Execution History</h2>
+			<div class="history-list">
+				{#each historyList as item}
+					<button
+						class="history-item"
+						on:click={() => loadHistoryItem(item)}
+					>
+						<div class="hist-left-bar"></div>
+						<div class="hist-content">
+							<div class="hist-date">{item.date}</div>
+							<div class="hist-detail">
+								{item.script}
+								<span class="hist-args">({item.args})</span>
+							</div>
+						</div>
+						<div class="hist-arrow">👉</div>
+					</button>
+				{/each}
+				{#if historyList.length === 0}<p>No history yet.</p>{/if}
+			</div>
+		{/if}
+
+		{#if activeTab === "settings"}
+			<h2>Settings</h2>
+			<div class="settings-form">
+				<label>Google Gemini API Key</label>
+				<input
+					type="password"
+					bind:value={apiKey}
+					placeholder="AIza..."
+				/>
+				<button class="save-btn" on:click={saveSettings}
+					>Save Settings</button
 				>
 			</div>
-			<pre>{logs}</pre>
-		</div>
-
-		<div class="panel ai-panel">
-			<div class="panel-header">
-				<h2>AI Analysis</h2>
-				<button
-					class="copy-btn"
-					on:click={() => copyToClipboard(analysis, "ai")}
-					>{aiCopyLabel}</button
-				>
-			</div>
-			<div class="markdown-content markdown-body">
-				{#await marked.parse(analysis)}
-					<p>Rendering...</p>
-				{:then html}
-					{@html html}
-				{/await}
-			</div>
-		</div>
-	</div>
-</main>
+		{/if}
+	</main>
+</div>
 
 <style>
 	:global(body) {
 		margin: 0;
-		background: #1a1b26;
-		color: #a9b1d6;
+		background: #13141f;
+		color: #c0caf5;
 		font-family: "Segoe UI", sans-serif;
+		overflow: hidden;
 	}
-	.container {
-		height: 100vh;
-		display: flex;
-		flex-direction: column;
-		padding: 15px;
-		box-sizing: border-box;
-	}
-	h1 {
-		margin: 0 0 15px 0;
-		font-size: 1.2rem;
-		color: #7aa2f7;
-		letter-spacing: 1px;
+	:global(::-webkit-scrollbar) {
+		display: none;
 	}
 
-	.controls {
+	.layout {
+		display: flex;
+		height: 100vh;
+	}
+
+	/* Sidebar */
+	.sidebar {
+		width: 60px;
+		background: #1a1b26;
+		border-right: 1px solid #2f334d;
+		display: flex;
+		flex-direction: column;
+		transition: width 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+		overflow: hidden;
+		flex-shrink: 0;
+		z-index: 100;
+	}
+	.sidebar.open {
+		width: 200px;
+	}
+	.sidebar-header {
+		height: 60px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+	}
+	.sidebar.open .sidebar-header {
+		justify-content: flex-start;
+		padding-left: 20px;
+	}
+	.hamburger {
+		background: transparent;
+		border: none;
+		color: #7aa2f7;
+		font-size: 1.5rem;
+		cursor: pointer;
+	}
+	.brand {
+		font-weight: bold;
+		color: #c0caf5;
+		margin-left: 10px;
+		white-space: nowrap;
+		animation: fadeIn 0.3s;
+	}
+	.sidebar nav button {
+		width: 100%;
+		height: 50px;
+		background: transparent;
+		border: none;
+		color: #565f89;
+		cursor: pointer;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		transition: 0.2s;
+	}
+	.sidebar.open nav button {
+		justify-content: flex-start;
+		padding-left: 20px;
+	}
+	.sidebar nav button:hover {
+		background: #24283b;
+		color: #c0caf5;
+	}
+	.sidebar nav button.active {
+		color: #7aa2f7;
+		background: #1f2335;
+		border-right: 3px solid #7aa2f7;
+	}
+	.icon {
+		font-size: 1.2rem;
+		min-width: 60px;
+		text-align: center;
+	}
+	.text {
+		white-space: nowrap;
+		animation: fadeIn 0.3s;
+	}
+
+	/* Content */
+	.content {
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+		padding: 20px;
+		overflow: hidden;
+		gap: 15px;
+	}
+
+	/* Controls */
+	.controls-area {
 		display: flex;
 		flex-direction: column;
 		gap: 10px;
-		margin-bottom: 15px;
-		background: #24283b;
-		padding: 15px;
-		border-radius: 8px;
-		border: 1px solid #414868;
 	}
 	.control-row {
 		display: flex;
 		gap: 10px;
-		width: 100%;
 	}
-	.bottom-row {
+	.bottom {
 		align-items: stretch;
 	}
 
-	.input-group {
+	.input-wrap {
+		background: #1a1b26;
+		border: 1px solid #2f334d;
 		display: flex;
 		align-items: center;
-		gap: 8px;
-		background: #1a1b26;
-		border: 1px solid #414868;
-		border-radius: 4px;
-		padding: 4px 8px;
+		padding: 0 10px;
+		border-radius: 6px;
 	}
-
-	.file-group {
+	.input-wrap .label {
+		font-size: 0.8rem;
+		font-weight: bold;
+		color: #7dcfff;
+		margin-right: 10px;
+	}
+	.focus-wrap {
 		flex: 1;
+		border: 1px solid #3b4261;
+		transition: 0.2s;
 	}
-	.args-group {
-		width: 120px;
-		flex-shrink: 0;
+	.focus-wrap:focus-within {
+		border-color: #7aa2f7;
 	}
-	.focus-group {
-		flex: 1;
-	} /* Focus欄を広く取る */
 
 	input {
 		background: transparent;
 		border: none;
-		color: #c0caf5;
-		padding: 8px;
-		font-family: "Consolas", monospace;
-		outline: none;
+		color: white;
+		padding: 10px;
 		width: 100%;
+		outline: none;
+		font-family: Consolas, monospace;
 	}
 	.path-input {
-		cursor: pointer;
-	}
-	.focus-input {
-		font-family: "Segoe UI", sans-serif;
-	}
-
-	.label {
-		font-weight: bold;
-		color: #e0af68;
-		font-size: 0.9rem;
-		white-space: nowrap;
+		background: #1a1b26;
+		border: 1px solid #2f334d;
+		border-radius: 6px;
+		flex: 1;
 	}
 
+	/* Buttons */
+	.action-buttons {
+		display: flex;
+		gap: 10px;
+	} /* ★ボタン群をまとめる */
 	button {
 		cursor: pointer;
 		border: none;
-		border-radius: 4px;
+		border-radius: 6px;
 		font-weight: bold;
 		transition: 0.2s;
+		white-space: nowrap;
 	}
 	.icon-btn {
-		background: transparent;
-		font-size: 1.2rem;
-		padding: 0 5px;
+		padding: 0 15px;
+		background: #24283b;
+		color: #fff;
 	}
+
+	.run-btn,
+	.ask-btn,
+	.stop-btn {
+		padding: 0 24px 0 16px; /* 右を広く(24px)、左を狭く(16px)して中身を左に寄せる */
+		min-width: 110px; /* 少しだけ幅を広げて余裕を持たせる */
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 6px; /* アイコンと文字の間隔を明示 */
+	}
+
 	.run-btn {
-		padding: 0 20px;
 		background: #7aa2f7;
 		color: #1a1b26;
-		white-space: nowrap;
-		min-width: 100px;
 	}
 	.run-btn:hover {
-		opacity: 0.9;
+		background: #89b4fa;
 	}
-	.run-btn:disabled {
+
+	.ask-btn {
+		background: #bb9af7;
+		color: #1a1b26;
+	}
+	.ask-btn:hover {
+		background: #d0aeff;
+	}
+
+	.stop-btn {
+		background: #f7768e;
+		color: #1a1b26;
+		animation: pulse 1.5s infinite;
+	}
+
+	button:disabled {
 		background: #2f334d;
 		color: #565f89;
 		cursor: not-allowed;
 	}
-	.run-btn.processing {
-		animation: pulse 2s infinite;
+
+	/* Graph */
+	.chart-wrapper {
+		height: 200px; /* ★高さ固定 */
+		min-height: 200px;
+		background: #1a1b26;
+		border: 1px solid #2f334d;
+		border-radius: 8px;
+		padding: 10px;
+		position: relative;
 	}
 
+	/* Panels */
 	.panels {
+		flex: 1;
 		display: flex;
 		gap: 15px;
-		flex: 1;
 		min-height: 0;
 	}
 	.panel {
 		flex: 1;
-		background: #24283b;
+		background: #1a1b26;
+		border: 1px solid #2f334d;
 		border-radius: 8px;
-		padding: 15px;
 		display: flex;
 		flex-direction: column;
-		border: 1px solid #414868;
+		padding: 10px;
 	}
-	.panel-header {
+	.panel-head {
 		display: flex;
 		justify-content: space-between;
-		align-items: center;
-		border-bottom: 1px solid #414868;
-		padding-bottom: 10px;
-		margin-bottom: 10px;
-	}
-	h2 {
-		margin: 0;
-		font-size: 0.95rem;
+		margin-bottom: 5px;
 		color: #bb9af7;
+		font-weight: bold;
+		font-size: 0.9rem;
 	}
-
 	.copy-btn {
 		background: transparent;
-		border: 1px solid #414868;
 		color: #565f89;
-		padding: 2px 10px;
-		font-size: 0.75rem;
-		border-radius: 4px;
+		font-size: 0.8rem;
+		padding: 2px 8px;
+		border: 1px solid #2f334d;
 	}
 	.copy-btn:hover {
 		color: #c0caf5;
 		border-color: #c0caf5;
 	}
 
-	pre {
+	pre,
+	.markdown-body {
 		flex: 1;
 		overflow-y: auto;
-		font-family: "Consolas", monospace;
-		font-size: 0.85rem;
-		line-height: 1.4;
-		color: #9ece6a;
+		font-size: 0.9rem;
 		margin: 0;
+		color: #c0caf5;
+		line-height: 1.5;
+	}
+	pre {
+		font-family: Consolas, monospace;
+		color: #9ece6a;
 		white-space: pre-wrap;
 	}
 
-	.markdown-content {
-		flex: 1;
-		overflow-y: auto;
-		color: #c0caf5;
-		font-size: 0.9rem;
-		line-height: 1.6;
-	}
-	.markdown-content :global(h1),
-	.markdown-content :global(h2),
-	.markdown-content :global(h3) {
+	/* Markdown */
+	.markdown-body :global(h1),
+	.markdown-body :global(h2) {
+		font-size: 1.1rem;
 		color: #7aa2f7;
+		border-bottom: 1px solid #2f334d;
 		margin-top: 1em;
-		border-bottom: 1px solid #414868;
-		padding-bottom: 0.3em;
 	}
-	.markdown-content :global(p) {
-		margin-bottom: 1em;
-	}
-	.markdown-content :global(ul),
-	.markdown-content :global(ol) {
-		padding-left: 1.5em;
-		margin-bottom: 1em;
-	}
-	.markdown-content :global(li) {
-		margin-bottom: 0.3em;
-	}
-	.markdown-content :global(strong) {
+	.markdown-body :global(strong) {
 		color: #e0af68;
 	}
-	.markdown-content :global(code) {
-		background: #1a1b26;
-		padding: 2px 6px;
-		border-radius: 4px;
-		font-family: "Consolas", monospace;
-		color: #ff9e64;
+	.loading {
+		color: #565f89;
+		font-style: italic;
 	}
-	.markdown-content :global(pre) {
-		background: #1a1b26;
-		padding: 10px;
-		border-radius: 6px;
-		overflow-x: auto;
-		margin-bottom: 1em;
+
+	/* History Styling Improved */
+	.history-list {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		overflow-y: auto;
+		height: 100%;
 	}
-	.markdown-content :global(pre code) {
-		background: transparent;
+	.history-item {
+		background: #1a1b26;
 		padding: 0;
+		border: 1px solid #2f334d;
+		border-radius: 6px;
+		display: flex;
+		align-items: center;
+		overflow: hidden;
+		transition: 0.2s;
+	}
+	.history-item:hover {
+		transform: translateX(5px);
+		border-color: #7aa2f7;
+	}
+
+	.hist-left-bar {
+		width: 4px;
+		background: #7aa2f7;
+		align-self: stretch;
+	}
+	.hist-content {
+		padding: 12px;
+		flex: 1;
+		text-align: left;
+	}
+	.hist-date {
+		font-size: 0.75rem;
+		color: #565f89;
+		margin-bottom: 2px;
+	}
+	.hist-detail {
+		font-weight: bold;
+		font-size: 0.95rem;
 		color: #c0caf5;
+	}
+	.hist-args {
+		font-weight: normal;
+		color: #7aa2f7;
+		font-size: 0.8rem;
+	}
+	.hist-arrow {
+		padding-right: 15px;
+		opacity: 0;
+		transition: 0.2s;
+	}
+	.history-item:hover .hist-arrow {
+		opacity: 1;
+	}
+
+	/* Settings */
+	.settings-form {
+		max-width: 400px;
+		display: flex;
+		flex-direction: column;
+		gap: 15px;
+	}
+	.save-btn {
+		background: #9ece6a;
+		color: #1a1b26;
+		padding: 10px;
 	}
 
 	@keyframes pulse {
@@ -405,19 +799,20 @@
 			opacity: 1;
 		}
 		50% {
-			opacity: 0.5;
+			opacity: 0.7;
 		}
 		100% {
 			opacity: 1;
 		}
 	}
-
-	:global(::-webkit-scrollbar) {
-		display: none;
-	}
-
-	:global(*) {
-		scrollbar-width: none; /* Firefox */
-		-ms-overflow-style: none; /* IE/Edge */
+	@keyframes fadeIn {
+		from {
+			opacity: 0;
+			transform: translateX(-10px);
+		}
+		to {
+			opacity: 1;
+			transform: translateX(0);
+		}
 	}
 </style>
