@@ -53,14 +53,15 @@
 
 	// --- グラフ初期化 ---
 	async function initChart() {
-		await tick(); // DOMの描画待ち
-		if (!chartCanvas) return; // キャンバスがないなら何もしない
+		await tick();
+		if (!chartCanvas) return;
 
-		if (chartInstance) chartInstance.destroy(); // 既存なら破棄
+		if (chartInstance) chartInstance.destroy();
 
 		chartInstance = new Chart(chartCanvas, {
 			type: "line",
 			data: {
+				// ... (データ部分はそのまま)
 				labels: [],
 				datasets: [
 					{
@@ -80,27 +81,32 @@
 				responsive: true,
 				maintainAspectRatio: false,
 				animation: false,
-				interaction: {
-					mode: "index",
-					intersect: false,
-				},
+				interaction: { mode: "index", intersect: false },
 				scales: {
 					x: { display: false },
 					y: {
-						beginAtZero: true,
+						// ★ここを変更: 対数スケールにする
+						type: "logarithmic",
+
+						// ★重要: log(0)は計算できないため、最小値を設定しておく
+						min: 0.001,
+
 						grid: { color: "#2f334d" },
-						ticks: { color: "#565f89", maxTicksLimit: 6 },
-						suggestedMax: 100,
+						ticks: {
+							color: "#565f89",
+							maxTicksLimit: 6,
+							// 対数表記を見やすくするフォーマッター
+							callback: function (value, index, values) {
+								return Number(value).toString() + "%";
+							},
+						},
 					},
 				},
 				plugins: { legend: { display: false } },
 			},
 		});
 
-		// ログが既に存在する場合（Historyから戻った時など）、グラフを復元しようとする
-		if (logs) {
-			rebuildGraphFromLogs(logs);
-		}
+		if (logs) rebuildGraphFromLogs(logs);
 	}
 
 	function rebuildGraphFromLogs(fullLog: string) {
