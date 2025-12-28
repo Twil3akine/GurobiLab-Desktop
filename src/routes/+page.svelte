@@ -11,6 +11,7 @@
 	let argsStr = "";
 	let focusPoint = "";
 	let apiKey = "";
+	let selectedModel = "gemini-2.5-flash";
 	let isMenuOpen = false;
 
 	let logs = "";
@@ -36,9 +37,20 @@
 	// プレビュー前の解析結果を避難させておく変数
 	let lastAnalysis = "";
 
+	// Google Geminiのモデルリスト
+	const availableModels = [
+		{ id: "gemini-2.5-flash-lite", name: "Gemini 2.5 Flash Lite" },
+		{ id: "gemini-2.5-flash", name: "Gemini 2.5 Flash" },
+		{ id: "gemini-2.5-pro", name: "Gemini 2.5 Pro" },
+		{ id: "gemini-3-flash-preview", name: "Gemini 3 Flash" },
+		{ id: "gemini-3-pro-preview", name: "Gemini 3 Pro" },
+	];
+
 	// --- ライフサイクル ---
 	onMount(() => {
 		apiKey = localStorage.getItem("gurobi_app_apikey") || "";
+		selectedModel =
+			localStorage.getItem("gurobi_app_model") || "gemini-2.5-flash";
 		const savedHist = localStorage.getItem("gurobi_app_history");
 		if (savedHist) historyList = JSON.parse(savedHist);
 	});
@@ -249,6 +261,7 @@
 				log: logs,
 				focusPoint,
 				apiKey,
+				modelName: selectedModel,
 			})) as string;
 			analysis = rawAnalysis;
 			status = "Ready";
@@ -307,6 +320,7 @@
 
 	function saveSettings() {
 		localStorage.setItem("gurobi_app_apikey", apiKey);
+		localStorage.setItem("gurobi_app_model", selectedModel);
 		alert("Settings Saved!");
 	}
 
@@ -495,16 +509,54 @@
 
 		{#if activeTab === "settings"}
 			<h2>Settings</h2>
-			<div class="settings-form">
-				<label>Google Gemini API Key</label>
-				<input
-					type="password"
-					bind:value={apiKey}
-					placeholder="AIza..."
-				/>
-				<button class="save-btn" on:click={saveSettings}
-					>Save Settings</button
-				>
+			<div class="settings-container">
+				<div class="setting-card">
+					<div class="card-header">
+						<h3>🤖 AI Model</h3>
+						<p>Select the intelligence level required.</p>
+					</div>
+					<div class="card-body">
+						<label>Model Selection</label>
+						<div class="select-wrapper">
+							<select bind:value={selectedModel}>
+								{#each availableModels as model}
+									<option value={model.id}
+										>{model.name}</option
+									>
+								{/each}
+							</select>
+							<span class="select-arrow">▼</span>
+						</div>
+						<p class="hint">
+							* <b>Flash</b> is faster and cheaper. <br />
+							* <b>Pro</b> is better for complex reasoning but slower.
+						</p>
+					</div>
+				</div>
+
+				<div class="setting-card">
+					<div class="card-header">
+						<h3>🔑 API Credentials</h3>
+						<p>Google Gemini API Key is required.</p>
+					</div>
+					<div class="card-body">
+						<label>Google Gemini API Key</label>
+						<div class="input-with-icon">
+							<span class="input-icon">🔒</span>
+							<input
+								type="password"
+								bind:value={apiKey}
+								placeholder="AIzaSy..."
+							/>
+						</div>
+
+						<div class="actions">
+							<button class="save-btn" on:click={saveSettings}>
+								💾 Save Configuration
+							</button>
+						</div>
+					</div>
+				</div>
 			</div>
 		{/if}
 	</main>
@@ -882,21 +934,146 @@
 	}
 
 	/* Settings */
-	.settings-form {
-		max-width: 400px;
+	.settings-container {
+		display: flex;
+		flex-direction: column;
+		gap: 20px;
+		max-width: 600px; /* 横幅を制限して見やすく */
+		margin-top: 10px;
+		animation: fadeIn 0.4s ease-out;
+	}
+
+	.setting-card {
+		background: #1a1b26;
+		border: 1px solid #2f334d;
+		border-radius: 12px;
+		overflow: hidden;
+		box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+	}
+
+	.card-header {
+		background: #24283b;
+		padding: 15px 20px;
+		border-bottom: 1px solid #2f334d;
+	}
+	.card-header h3 {
+		margin: 0;
+		font-size: 1.1rem;
+		color: #7aa2f7;
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+	.card-header p {
+		margin: 5px 0 0 0;
+		font-size: 0.85rem;
+		color: #565f89;
+	}
+
+	.card-body {
+		padding: 20px;
 		display: flex;
 		flex-direction: column;
 		gap: 15px;
 	}
-	.settings-form input {
-		background: #1a1b26;
-		border: 1px solid #2f334d;
-		border-radius: 6px;
+
+	label {
+		font-size: 0.9rem;
+		font-weight: bold;
+		color: #c0caf5;
+		margin-bottom: -5px; /* inputとの距離を縮める */
 	}
+
+	/* Input & Select 共通スタイル */
+	input,
+	select {
+		width: 100%;
+		background: #16161e; /* 背景を少し暗くして入力欄を目立たせる */
+		border: 1px solid #2f334d;
+		border-radius: 8px;
+		padding: 12px 15px;
+		color: #fff;
+		font-family: "Segoe UI", sans-serif;
+		font-size: 0.95rem;
+		transition:
+			border-color 0.2s,
+			box-shadow 0.2s;
+		box-sizing: border-box; /* パディングを含めた幅計算 */
+	}
+
+	input:focus,
+	select:focus {
+		border-color: #7aa2f7;
+		box-shadow: 0 0 0 3px rgba(122, 162, 247, 0.2);
+		outline: none;
+	}
+
+	/* アイコン付き入力欄 */
+	.input-with-icon {
+		position: relative;
+	}
+	.input-with-icon input {
+		padding-left: 40px;
+	}
+	.input-icon {
+		position: absolute;
+		left: 12px;
+		top: 50%;
+		transform: translateY(-50%);
+		color: #565f89;
+	}
+
+	/* セレクトボックスのカスタム */
+	.select-wrapper {
+		position: relative;
+	}
+	.select-wrapper select {
+		appearance: none; /* デフォルトの矢印を消す */
+		cursor: pointer;
+	}
+	.select-arrow {
+		position: absolute;
+		right: 15px;
+		top: 50%;
+		transform: translateY(-50%);
+		color: #7aa2f7;
+		pointer-events: none;
+		font-size: 0.8rem;
+	}
+
+	.hint {
+		font-size: 0.8rem;
+		color: #565f89;
+		margin: 0;
+		line-height: 1.4;
+	}
+
+	.actions {
+		display: flex;
+		justify-content: flex-end; /* 右寄せ */
+		margin-top: 10px;
+	}
+
 	.save-btn {
-		background: #9ece6a;
+		background: linear-gradient(
+			135deg,
+			#9ece6a 0%,
+			#73daca 100%
+		); /* グラデーション */
 		color: #1a1b26;
-		padding: 10px;
+		padding: 12px 25px;
+		font-weight: bold;
+		border-radius: 8px;
+		box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2);
+		border: none;
+		cursor: pointer;
+		transition: transform 0.1s;
+	}
+	.save-btn:active {
+		transform: scale(0.98);
+	}
+	.save-btn:hover {
+		opacity: 0.9;
 	}
 
 	@keyframes pulse {

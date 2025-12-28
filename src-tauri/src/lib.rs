@@ -240,16 +240,24 @@ fn debug_prompt(log: String, focus_point: String) -> String {
 }
 
 #[command]
-async fn analyze_log(log: String, focus_point: String, api_key: String) -> Result<String, String> {
+async fn analyze_log(
+    log: String,
+    focus_point: String,
+    api_key: String,
+    model_name: String,
+) -> Result<String, String> {
     if api_key.is_empty() {
         return Err("APIキーが設定されていません。".to_string());
     }
 
-    // ★共通関数を使ってプロンプト生成
+    // 共通関数を使ってプロンプト生成
     let prompt = build_prompt_string(&log, &focus_point);
 
+    // URLの中に model_name を埋め込む
+    // 例: "gemini-1.5-flash" や "gemini-1.5-pro" などが来る
     let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={}",
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+        model_name, // ここで使用
         api_key
     );
 
