@@ -101,7 +101,7 @@ fn compress_log_for_ai(full_log: &str) -> String {
                 numeric_row_count += 1;
                 // 「最初の方」または「20行に1回」だけ残す
                 // ※序盤(50行目まで)は動きが激しいので全部残し、それ以降は間引く、という手もあり
-                if numeric_row_count < 20 || numeric_row_count % 20 == 0 {
+                if numeric_row_count < 15 || numeric_row_count % 15 == 0 {
                     return true;
                 }
                 return false; // それ以外は捨てる

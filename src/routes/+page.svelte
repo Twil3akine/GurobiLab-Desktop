@@ -29,6 +29,13 @@
 	let chartCanvas: HTMLCanvasElement;
 	let chartInstance: Chart | null = null;
 
+	// プレビューモードかどうかのフラグ
+	let isPreview = false;
+	let tokenStats = "";
+
+	// プレビュー前の解析結果を避難させておく変数
+	let lastAnalysis = "";
+
 	// --- ライフサイクル ---
 	onMount(() => {
 		apiKey = localStorage.getItem("gurobi_app_apikey") || "";
@@ -61,7 +68,6 @@
 		chartInstance = new Chart(chartCanvas, {
 			type: "line",
 			data: {
-				// ... (データ部分はそのまま)
 				labels: [],
 				datasets: [
 					{
@@ -86,16 +92,26 @@
 					x: { display: false },
 					y: {
 						type: "logarithmic",
-
+						// 下限設定
 						min: 0.0001,
-
 						grid: { color: "#2f334d" },
 						ticks: {
 							color: "#565f89",
-							maxTicksLimit: 6,
-							// 対数表記を見やすくするフォーマッター
+							maxTicksLimit: 20,
 							callback: function (value, index, values) {
-								return Number(value).toString() + "%";
+								const num = Number(value);
+								const log10 = Math.log10(num);
+								// 10の乗数のみ表示
+								if (
+									Math.abs(log10 - Math.round(log10)) < 1e-9
+								) {
+									return (
+										num.toLocaleString("en-US", {
+											maximumSignificantDigits: 1,
+										}) + "%"
+									);
+								}
+								return null;
 							},
 						},
 					},
@@ -109,10 +125,8 @@
 
 	function rebuildGraphFromLogs(fullLog: string) {
 		if (!chartInstance) return;
-		// データリセット
 		chartInstance.data.labels = [];
 		chartInstance.data.datasets[0].data = [];
-
 		fullLog.split("\n").forEach((line) => parseLogForGraph(line, false));
 		chartInstance.update();
 	}
@@ -130,7 +144,6 @@
 		logs = "";
 		analysis = "";
 
-		// グラフリセット
 		if (chartInstance) {
 			chartInstance.data.labels = [];
 			chartInstance.data.datasets[0].data = [];
@@ -140,8 +153,7 @@
 		unlistenLog = await listen<string>("log-output", (event) => {
 			const line = event.payload;
 			logs += line + "\n";
-			parseLogForGraph(line, true); // リアルタイム更新
-
+			parseLogForGraph(line, true);
 			const el = document.querySelector(".log-panel pre");
 			if (el) el.scrollTop = el.scrollHeight;
 		});
@@ -159,7 +171,6 @@
 			logs = finalLog;
 			cleanupListeners();
 
-			// AI解析へ
 			await askAI();
 			saveHistory();
 		} catch (error) {
@@ -172,21 +183,73 @@
 		}
 	}
 
+	// --- デバッグ＆AI解析 ---
+	async function showPromptPreview() {
+		if (!logs) return;
+		analysis = "Generating prompt preview...";
+		isPreview = true;
+		try {
+			const rawPrompt = (await invoke("debug_prompt", {
+				log: logs,
+				focusPoint,
+			})) as string;
+			const charCount = rawPrompt.length;
+			tokenStats = `Length: ${charCount} chars`;
+			analysis = `--- PROMPT PREVIEW (${tokenStats}) ---\n\n${rawPrompt}`;
+		} catch (e) {
+			analysis = "Error generating preview: " + e;
+		}
+	}
+
+	// ★変更: プレビューの表示/非表示を切り替える関数
+	async function togglePreview() {
+		if (isPreview) {
+			// ■ 戻る処理
+			analysis = lastAnalysis; // 避難させていた内容を戻す
+			isPreview = false;
+		} else {
+			// ■ プレビュー表示処理
+			if (!logs) return;
+
+			lastAnalysis = analysis; // 現在の表示（解析結果）を避難
+
+			analysis = "Generating prompt preview...";
+			isPreview = true;
+
+			try {
+				const rawPrompt = (await invoke("debug_prompt", {
+					log: logs,
+					focusPoint,
+				})) as string;
+
+				const charCount = rawPrompt.length;
+				tokenStats = `Length: ${charCount} chars`;
+				analysis = `--- PROMPT PREVIEW (${tokenStats}) ---\n\n${rawPrompt}`;
+			} catch (e) {
+				analysis = "Error generating preview: " + e;
+			}
+		}
+	}
+
+	// AI解析実行時はプレビューモードを強制解除
 	async function askAI() {
 		if (!logs) {
 			status = "No Logs";
 			return;
 		}
+
+		// もしプレビュー中なら、元の状態に戻してから解析を始める必要はないが、
+		// 内部フラグはリセットしておく
+		isPreview = false;
+
 		status = "Analyzing...";
 		isProcessing = true;
-
 		try {
 			const rawAnalysis = (await invoke("analyze_log", {
 				log: logs,
 				focusPoint,
 				apiKey,
 			})) as string;
-
 			analysis = rawAnalysis;
 			status = "Ready";
 		} catch (error) {
@@ -209,22 +272,15 @@
 		}
 	}
 
-	// --- グラフ更新ロジック ---
 	function parseLogForGraph(line: string, doUpdate: boolean) {
-		// 正規表現を少し緩くしました（空白の扱いなど）
-		// "Gap"という単語があってもなくても、行末付近の % を拾う
 		const match = line.match(/(\d+(?:\.\d+)?)%/);
-
 		if (match && chartInstance) {
 			let val = parseFloat(match[1]);
-			// Gapは通常0~100の間。異常値は弾く
 			if (!isNaN(val) && val <= 1000) {
 				val = Math.max(val, 0.0001);
-
 				const label = chartInstance.data.labels?.length || 0;
 				chartInstance.data.labels?.push(label);
 				chartInstance.data.datasets[0].data.push(val);
-
 				if (doUpdate) chartInstance.update();
 			}
 		}
@@ -247,8 +303,6 @@
 		logs = item.log;
 		analysis = item.analysis;
 		activeTab = "main";
-		// mainに戻った直後にグラフ再構築が走るように tick を使うか、
-		// initChart内でログがあれば再構築するロジックに任せる
 	}
 
 	function saveSettings() {
@@ -359,6 +413,18 @@
 							>
 								💬 Ask AI
 							</button>
+
+							<button
+								class="debug-btn"
+								class:active-mode={isPreview}
+								on:click={togglePreview}
+								disabled={!logs || isProcessing}
+								title={isPreview
+									? "Close Preview"
+									: "See raw prompt"}
+							>
+								{isPreview ? "↩" : "🔍"}
+							</button>
 						{/if}
 					</div>
 				</div>
@@ -381,7 +447,7 @@
 				</div>
 				<div class="panel">
 					<div class="panel-head">
-						<span>Analysis</span>
+						<span>{isPreview ? "Prompt Preview" : "Analysis"}</span>
 						<button
 							class="copy-btn"
 							on:click={() => copyToClipboard(analysis)}
@@ -389,11 +455,16 @@
 						>
 					</div>
 					<div class="markdown-body">
-						{#await marked.parse(analysis)}
-							<p class="loading">Thinking...</p>
-						{:then html}
-							{@html html}
-						{/await}
+						{#if isPreview}
+							<pre
+								style="white-space: pre-wrap; word-break: break-all; color: #7dcfff; font-size: 0.8rem;">{analysis}</pre>
+						{:else}
+							{#await marked.parse(analysis)}
+								<p class="loading">Thinking...</p>
+							{:then html}
+								{@html html}
+							{/await}
+						{/if}
 					</div>
 				</div>
 			</div>
@@ -597,7 +668,7 @@
 	.action-buttons {
 		display: flex;
 		gap: 10px;
-	} /* ★ボタン群をまとめる */
+	}
 	button {
 		cursor: pointer;
 		border: none;
@@ -615,12 +686,12 @@
 	.run-btn,
 	.ask-btn,
 	.stop-btn {
-		padding: 0 24px 0 16px; /* 右を広く(24px)、左を狭く(16px)して中身を左に寄せる */
-		min-width: 110px; /* 少しだけ幅を広げて余裕を持たせる */
+		padding: 0 24px 0 16px;
+		min-width: 110px;
 		display: flex;
 		align-items: center;
 		justify-content: center;
-		gap: 6px; /* アイコンと文字の間隔を明示 */
+		gap: 6px;
 	}
 
 	.run-btn {
@@ -639,6 +710,29 @@
 		background: #d0aeff;
 	}
 
+	.debug-btn {
+		padding: 0 15px;
+		min-width: 50px;
+		background: #2f334d;
+		color: #7dcfff;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		/*font-size: 1.1rem;*/
+	}
+	.debug-btn:hover {
+		background: #3b4261;
+	}
+
+	/* プレビュー中のボタン色（黄色っぽくして注意を引くなど） */
+	.debug-btn.active-mode {
+		background: #e0af68;
+		color: #1a1b26;
+	}
+	.debug-btn.active-mode:hover {
+		background: #ffc777;
+	}
+
 	.stop-btn {
 		background: #f7768e;
 		color: #1a1b26;
@@ -653,7 +747,7 @@
 
 	/* Graph */
 	.chart-wrapper {
-		height: 200px; /* ★高さ固定 */
+		height: 200px;
 		min-height: 200px;
 		background: #1a1b26;
 		border: 1px solid #2f334d;
@@ -677,6 +771,7 @@
 		display: flex;
 		flex-direction: column;
 		padding: 10px;
+		min-width: 0;
 	}
 	.panel-head {
 		display: flex;
@@ -729,7 +824,7 @@
 		font-style: italic;
 	}
 
-	/* History Styling Improved */
+	/* History Styling */
 	.history-list {
 		display: flex;
 		flex-direction: column;
@@ -792,6 +887,11 @@
 		display: flex;
 		flex-direction: column;
 		gap: 15px;
+	}
+	.settings-form input {
+		background: #1a1b26;
+		border: 1px solid #2f334d;
+		border-radius: 6px;
 	}
 	.save-btn {
 		background: #9ece6a;
