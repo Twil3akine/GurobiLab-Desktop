@@ -260,8 +260,6 @@
 			return;
 		}
 
-		// もしプレビュー中なら、元の状態に戻してから解析を始める必要はないが、
-		// 内部フラグはリセットしておく
 		isPreview = false;
 
 		status = "Analyzing...";
@@ -272,7 +270,11 @@
 				focusPoint,
 				apiKey,
 				modelName: selectedModel,
+				// ★追加: これが必要です！
+				// Rustの system_instruction 引数に対応します
+				systemInstruction: systemPrompt,
 			})) as string;
+
 			analysis = rawAnalysis;
 			status = "Ready";
 		} catch (error) {

@@ -1,7 +1,6 @@
 use regex::Regex;
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::env;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
@@ -32,7 +31,7 @@ fn clean_gurobi_log(raw_log: &str) -> String {
 fn prune_json_recursively(v: &mut Value) {
     match v {
         Value::Array(arr) => {
-            // 配列の長さが「5」を超えていたらカットする
+            // 配列の長さが「3」を超えていたらカットする
             const MAX_ITEMS: usize = 3;
             if arr.len() > MAX_ITEMS {
                 let original_len = arr.len();
@@ -81,7 +80,6 @@ fn compress_log_for_ai(full_log: &str) -> String {
     log_part = re.replace_all(&log_part, " ").to_string();
 
     // 2. 行ごとの間引き処理 (Sampling)
-    // カウンターを使って、数字の行だけ「間引く」
     let mut numeric_row_count = 0;
 
     log_part = log_part
@@ -99,8 +97,7 @@ fn compress_log_for_ai(full_log: &str) -> String {
             if first_char.is_ascii_digit() {
                 // 数字で始まる行（通常のログ行）
                 numeric_row_count += 1;
-                // 「最初の方」または「20行に1回」だけ残す
-                // ※序盤(50行目まで)は動きが激しいので全部残し、それ以降は間引く、という手もあり
+                // 最初の15行、以降は15行おきに残す
                 if numeric_row_count < 15 || numeric_row_count % 15 == 0 {
                     return true;
                 }
@@ -120,29 +117,50 @@ fn compress_log_for_ai(full_log: &str) -> String {
     }
 }
 
+// ★修正: コマンド実行部分（cmdのハードコードを廃止、stdinを閉じる処理を追加）
 #[command]
 async fn run_optimization(
     window: Window,
-    state: State<'_, OptimizationState>,
+    _state: State<'_, OptimizationState>,
     script_path: String,
     args_str: String,
     command_prefix: String,
 ) -> Result<String, String> {
-    println!("実行: {} Args: [{}]", script_path, args_str);
+    println!(
+        "実行: {} Args: [{}] Prefix: [{}]",
+        script_path, args_str, command_prefix
+    );
 
-    let mut cmd_args = command_prefix.split_whitespace().collect::<Vec<&str>>();
+    // 1. プレフィックスを空白で分割
+    let mut parts = command_prefix.split_whitespace();
+
+    // 2. 最初の単語をプログラム名として取得 (例: "uv" や "python")
+    let program = parts.next().ok_or("Command prefix is empty")?;
+
+    // 3. 残りの単語を引数として収集
+    let mut cmd_args: Vec<&str> = parts.collect();
+
+    // 4. スクリプトパスを追加
     cmd_args.push(&script_path);
 
+    // 5. ユーザー引数を追加
     for arg in args_str.split_whitespace() {
         cmd_args.push(arg);
     }
 
-    let mut child = Command::new("cmd")
+    // ★重要: program変数を使い、stdinをnullにする
+    let mut child = Command::new(program)
         .args(&cmd_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .stdin(Stdio::null()) // ★追加: 入力待ちフリーズを防止
         .spawn()
-        .map_err(|e| format!("コマンド起動エラー: {}", e))?;
+        .map_err(|e| {
+            format!(
+                "コマンド起動エラー: {}\n(設定のCommand Prefixを確認してください)",
+                e
+            )
+        })?;
 
     let stdout = child.stdout.take().ok_or("stdout取得失敗")?;
     let stderr = child.stderr.take().ok_or("stderr取得失敗")?;
@@ -184,7 +202,6 @@ async fn run_optimization(
     let full_stderr = stderr_handle.join().unwrap_or_default();
 
     if status.success() {
-        // UIには「見やすいログ（clean_gurobi_log）」を返す
         Ok(clean_gurobi_log(&full_stdout))
     } else {
         Err(format!("Exit Code: {:?}\n{}", status.code(), full_stderr))
@@ -200,12 +217,12 @@ fn kill_process(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
-// 共通化: プロンプトを作成するだけの関数
-fn build_prompt_string(log: &str, focus_point: &str) -> String {
+// ★修正: 引数を整理 (system_instruction と focus_point を正しく受け取る)
+fn build_prompt_string(log: &str, focus_point: &str, system_instruction: &str) -> String {
     // 1. 強力圧縮
     let compressed_log = compress_log_for_ai(log);
 
-    // 2. 長さ制限 (例: 15000文字)
+    // 2. 長さ制限
     let final_log = if compressed_log.len() > 15000 {
         format!(
             "... (snip) ...\n{}",
@@ -215,8 +232,13 @@ fn build_prompt_string(log: &str, focus_point: &str) -> String {
         compressed_log
     };
 
-    // 3. ストイックな指示文 (改行・装飾排除)
-    let base_instruction = "あなたはデータサイエンティストです。以下の最適化計算ログを解析し、Markdown形式のレポートを作成してください。\n# 制約\n- 挨拶や前置きは不可。即座に見出し(#)から開始すること。\n- ログの引用は不可。";
+    // 3. 設定されたシステム指示を使用
+    // 設定が空ならデフォルトを使用する安全策
+    let base_prompt = if system_instruction.trim().is_empty() {
+        "あなたはデータサイエンティストです。以下の最適化計算ログを解析し、Markdown形式のレポートを作成してください。\n# 制約\n- 挨拶や前置きは不可。即座に見出し(#)から開始すること。\n- ログの引用は不可。"
+    } else {
+        system_instruction
+    };
 
     let mut user_focus = "特に、結果サマリと計算プロセスの健全性について記述すること。".to_string();
 
@@ -225,18 +247,17 @@ fn build_prompt_string(log: &str, focus_point: &str) -> String {
             .push_str(format!("追加指示:「{}」について深く考察すること。", focus_point).as_str());
     }
 
-    // 4. 結合 ([LOG]タグ使用)
-    format!("{}\n{}\n[LOG]\n{}", base_instruction, user_focus, final_log)
+    // 4. 結合
+    format!("{}\n{}\n[LOG]\n{}", base_prompt, user_focus, final_log)
 }
 
-// デバッグ用コマンド (プロンプトの中身をそのまま返す)
+// デバッグ用コマンド
+// ★注意: Svelte側が system_instruction を送っていない場合のためにデフォルト値で対応
 #[command]
 fn debug_prompt(log: String, focus_point: String) -> String {
-    let prompt = build_prompt_string(&log, &focus_point);
-    println!(
-        "--- DEBUG PROMPT START ---\n{}\n--- DEBUG PROMPT END ---",
-        prompt
-    ); // ターミナルにも出す
+    // プレビュー用にデフォルトのシステム指示を使用
+    let default_system = "あなたはデータサイエンティストです。(以下略...)";
+    let prompt = build_prompt_string(&log, &focus_point, default_system);
     prompt
 }
 
@@ -246,21 +267,18 @@ async fn analyze_log(
     focus_point: String,
     api_key: String,
     model_name: String,
-    system_instruction: String,
+    system_instruction: String, // ←これを受け取る
 ) -> Result<String, String> {
     if api_key.is_empty() {
         return Err("APIキーが設定されていません。".to_string());
     }
 
-    // 共通関数を使ってプロンプト生成
-    let prompt = build_prompt_string(&log, &system_instruction);
+    // ★修正: 引数の順番と渡し方を正しく
+    let prompt = build_prompt_string(&log, &focus_point, &system_instruction);
 
-    // URLの中に model_name を埋め込む
-    // 例: "gemini-1.5-flash" や "gemini-1.5-pro" などが来る
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-        model_name, // ここで使用
-        api_key
+        model_name, api_key
     );
 
     let client = Client::new();
@@ -272,12 +290,17 @@ async fn analyze_log(
         .send()
         .await
         .map_err(|e| e.to_string())?;
+
     let res_text = res.text().await.map_err(|e| e.to_string())?;
-    let json: serde_json::Value = serde_json::from_str(&res_text).map_err(|e| e.to_string())?;
+
+    // エラーハンドリング強化
+    let json: serde_json::Value = serde_json::from_str(&res_text)
+        .map_err(|_| format!("Google API returned invalid JSON: {}", res_text))?;
 
     if let Some(content) = json["candidates"][0]["content"]["parts"][0]["text"].as_str() {
         Ok(content.to_string())
     } else {
+        // エラー詳細を表示
         Err(format!("API Error: {}", res_text))
     }
 }
@@ -294,7 +317,7 @@ pub fn run() {
             run_optimization,
             analyze_log,
             kill_process,
-            debug_prompt // ★忘れずに追加
+            debug_prompt
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
