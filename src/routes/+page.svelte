@@ -12,6 +12,10 @@
 	let focusPoint = "";
 	let apiKey = "";
 	let selectedModel = "gemini-2.5-flash";
+	let pythonCommand = "uv run python -u";
+	let systemPrompt =
+		"あなたはデータサイエンティストです。以下の最適化計算ログを解析し、Markdown形式のレポートを作成してください。";
+
 	let isMenuOpen = false;
 
 	let logs = "";
@@ -51,6 +55,11 @@
 		apiKey = localStorage.getItem("gurobi_app_apikey") || "";
 		selectedModel =
 			localStorage.getItem("gurobi_app_model") || "gemini-2.5-flash";
+		pythonCommand =
+			localStorage.getItem("gurobi_app_command") || "uv run python -u";
+		systemPrompt =
+			localStorage.getItem("gurobi_app_prompt") ||
+			"あなたはデータサイエンティストです。以下の最適化計算ログを解析し、Markdown形式のレポートを作成してください。";
 		const savedHist = localStorage.getItem("gurobi_app_history");
 		if (savedHist) historyList = JSON.parse(savedHist);
 	});
@@ -178,6 +187,7 @@
 			const finalLog = (await invoke("run_optimization", {
 				scriptPath,
 				argsStr,
+				commandPrefix: pythonCommand,
 			})) as string;
 
 			logs = finalLog;
@@ -321,6 +331,9 @@
 	function saveSettings() {
 		localStorage.setItem("gurobi_app_apikey", apiKey);
 		localStorage.setItem("gurobi_app_model", selectedModel);
+		localStorage.setItem("gurobi_app_command", pythonCommand);
+		localStorage.setItem("gurobi_app_prompt", systemPrompt);
+
 		alert("Settings Saved!");
 	}
 
@@ -331,6 +344,14 @@
 			filters: [{ name: "Python Script", extensions: ["py"] }],
 		});
 		if (file) scriptPath = file as string;
+	}
+
+	// 履歴削除機能
+	function clearHistory() {
+		if (confirm("Are you sure you want to delete all execution history?")) {
+			historyList = [];
+			localStorage.removeItem("gurobi_app_history");
+		}
 	}
 
 	async function copyToClipboard(text: string) {
@@ -557,6 +578,71 @@
 						</div>
 					</div>
 				</div>
+
+				<div class="setting-card">
+					<div class="card-header">
+						<h3>🧠 System Instructions</h3>
+						<p>
+							Customize the persona and behavior of the AI
+							analyst.
+						</p>
+					</div>
+					<div class="card-body">
+						<label>Base Prompt</label>
+						<textarea
+							bind:value={systemPrompt}
+							rows="3"
+							placeholder="You are a helpful assistant..."
+						></textarea>
+						<p class="hint">
+							* Defines the "Role" of the AI.<br />
+							* This text is prefixed to every analysis request.
+						</p>
+					</div>
+				</div>
+
+				<div class="setting-card">
+					<div class="card-header">
+						<h3>🐍 Execution Environment</h3>
+						<p>Configure how Python scripts are executed.</p>
+					</div>
+					<div class="card-body">
+						<label>Command Prefix</label>
+						<div class="input-with-icon">
+							<span class="input-icon">💻</span>
+							<input
+								type="text"
+								bind:value={pythonCommand}
+								placeholder="uv run python -u"
+							/>
+						</div>
+						<p class="hint">
+							* Default: <code>uv run python -u</code><br />
+							* Change this if you want to use a specific
+							<code>venv</code> or global python.
+						</p>
+					</div>
+				</div>
+
+				<div class="setting-card danger-zone">
+					<div class="card-header">
+						<h3>🗑️ Data Management</h3>
+						<p>Manage local storage and cached history.</p>
+					</div>
+					<div class="card-body">
+						<div class="danger-row">
+							<div class="danger-text">
+								<strong>Clear History</strong>
+								<p>
+									Remove all saved logs and analysis results.
+								</p>
+							</div>
+							<button class="delete-btn" on:click={clearHistory}>
+								Delete All
+							</button>
+						</div>
+					</div>
+				</div>
 			</div>
 		{/if}
 	</main>
@@ -659,7 +745,7 @@
 		display: flex;
 		flex-direction: column;
 		padding: 20px;
-		overflow: hidden;
+		overflow-y: auto;
 		gap: 15px;
 	}
 
@@ -935,12 +1021,14 @@
 
 	/* Settings */
 	.settings-container {
-		display: flex;
-		flex-direction: column;
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
 		gap: 20px;
-		max-width: 600px; /* 横幅を制限して見やすく */
+		max-width: 1200px;
+		width: 100%;
 		margin-top: 10px;
 		animation: fadeIn 0.4s ease-out;
+		padding-bottom: 40px;
 	}
 
 	.setting-card {
@@ -970,11 +1058,37 @@
 		color: #565f89;
 	}
 
+	/* Settings Container を Grid レイアウトに変更 */
+	.settings-container {
+		display: grid; /* Grid レイアウトを有効化 */
+		/* 最小幅350pxのカードを、画面幅に合わせて自動で折り返して配置 */
+		grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+		gap: 20px; /* カード間の隙間 */
+		max-width: 1000px; /* 横幅制限を少し広げて2列表示しやすくする */
+		margin-top: 10px;
+		animation: fadeIn 0.4s ease-out;
+	}
+
+	/* 各設定カードの高さが揃うように調整 */
+	.setting-card {
+		background: #1a1b26;
+		border: 1px solid #2f334d;
+		border-radius: 12px;
+		overflow: hidden;
+		box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+		/* Grid内で高さが自動的に揃うようにする */
+		height: 100%;
+		display: flex;
+		flex-direction: column;
+	}
+
 	.card-body {
 		padding: 20px;
 		display: flex;
 		flex-direction: column;
 		gap: 15px;
+		/* カードの下部までコンテンツを引き伸ばす */
+		flex: 1;
 	}
 
 	label {
@@ -1074,6 +1188,69 @@
 	}
 	.save-btn:hover {
 		opacity: 0.9;
+	}
+
+	textarea {
+		width: 100%;
+		background: #16161e;
+		border: 1px solid #2f334d;
+		border-radius: 8px;
+		padding: 12px 15px;
+		color: #fff;
+		font-family: "Segoe UI", sans-serif;
+		font-size: 0.95rem;
+		resize: vertical; /* 縦方向のみリサイズ許可 */
+		min-height: 80px;
+	}
+	textarea:focus {
+		border-color: #7aa2f7;
+		outline: none;
+	}
+
+	code {
+		background: #24283b;
+		padding: 2px 5px;
+		border-radius: 4px;
+		color: #73daca;
+		font-family: Consolas, monospace;
+		font-size: 0.85rem;
+	}
+
+	/* Danger Zone Styling */
+	.setting-card.danger-zone {
+		border-color: #f7768e; /* 赤枠で警告感 */
+		grid-column: 1 / -1;
+	}
+	.setting-card.danger-zone .card-header h3 {
+		color: #f7768e;
+	}
+
+	.danger-row {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+	}
+	.danger-text strong {
+		color: #c0caf5;
+		display: block;
+	}
+	.danger-text p {
+		color: #565f89;
+		font-size: 0.85rem;
+		margin: 0;
+	}
+
+	.delete-btn {
+		background: transparent;
+		border: 1px solid #f7768e;
+		color: #f7768e;
+		padding: 8px 16px;
+		border-radius: 6px;
+		font-weight: bold;
+	}
+	.delete-btn:hover {
+		background: #f7768e;
+		color: #1a1b26;
 	}
 
 	@keyframes pulse {

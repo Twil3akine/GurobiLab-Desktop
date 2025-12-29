@@ -126,10 +126,11 @@ async fn run_optimization(
     state: State<'_, OptimizationState>,
     script_path: String,
     args_str: String,
+    command_prefix: String,
 ) -> Result<String, String> {
     println!("実行: {} Args: [{}]", script_path, args_str);
 
-    let mut cmd_args = vec!["/C", "uv", "run", "python", "-u"];
+    let mut cmd_args = command_prefix.split_whitespace().collect::<Vec<&str>>();
     cmd_args.push(&script_path);
 
     for arg in args_str.split_whitespace() {
@@ -199,7 +200,7 @@ fn kill_process(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
-// ★共通化: プロンプトを作成するだけの関数
+// 共通化: プロンプトを作成するだけの関数
 fn build_prompt_string(log: &str, focus_point: &str) -> String {
     // 1. 強力圧縮
     let compressed_log = compress_log_for_ai(log);
@@ -245,13 +246,14 @@ async fn analyze_log(
     focus_point: String,
     api_key: String,
     model_name: String,
+    system_instruction: String,
 ) -> Result<String, String> {
     if api_key.is_empty() {
         return Err("APIキーが設定されていません。".to_string());
     }
 
     // 共通関数を使ってプロンプト生成
-    let prompt = build_prompt_string(&log, &focus_point);
+    let prompt = build_prompt_string(&log, &system_instruction);
 
     // URLの中に model_name を埋め込む
     // 例: "gemini-1.5-flash" や "gemini-1.5-pro" などが来る
