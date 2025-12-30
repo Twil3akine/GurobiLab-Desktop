@@ -6,6 +6,9 @@
 	import { onDestroy, onMount, tick } from "svelte";
 	import Chart from "chart.js/auto";
 
+	import markedKatex from "marked-katex-extension";
+	import "katex/dist/katex.min.css";
+
 	// --- 変数定義 ---
 	let scriptPath = "";
 	let argsStr = "";
@@ -40,6 +43,13 @@
 
 	// プレビュー前の解析結果を避難させておく変数
 	let lastAnalysis = "";
+
+	marked.use(
+		markedKatex({
+			throwOnError: false,
+			output: "html", // または 'mathml'
+		}),
+	);
 
 	// Google Geminiのモデルリスト
 	const availableModels = [
@@ -270,7 +280,6 @@
 				focusPoint,
 				apiKey,
 				modelName: selectedModel,
-				// ★追加: これが必要です！
 				// Rustの system_instruction 引数に対応します
 				systemInstruction: systemPrompt,
 			})) as string;
