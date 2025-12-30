@@ -16,7 +16,10 @@
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "~2",
     "@tauri-apps/plugin-opener": "^2",
-    "marked": "^17.0.1"
+    "chart.js": "^4.5.1",
+    "katex": "^0.16.27",
+    "marked": "^17.0.1",
+    "marked-katex-extension": "^5.1.6"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.6",
